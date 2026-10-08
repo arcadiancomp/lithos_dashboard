@@ -143,6 +143,6 @@ installations.
 
 MIT
 
-## Autor
+## Author
 
 Arcadian Computers, LLC

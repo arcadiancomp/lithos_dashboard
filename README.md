@@ -6,6 +6,8 @@ miner, sequencer, and decentralized Ergo mining pool participant.
 
 Designed and tested on Linux with Lithos Client v1.0.2.
 
+![Lithos Dashboard](assets/lithos_dashboard.png)
+
 ## Features
 
 - Live Lithos difficulty commitment status

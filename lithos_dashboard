@@ -156,6 +156,181 @@ def kv(label, value, label_width=28):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Persistent NISP reliability tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+def default_nisp_state_file():
+    root = os.environ.get("XDG_STATE_HOME")
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(root, "lithos_dashboard", "nisp_history.json")
+
+
+def empty_nisp_history():
+    return {
+        "version": 1,
+        "trackingStartedAt": None,
+        "trackingStartedHeight": None,
+        "lastObservedAt": None,
+        "lastHeight": None,
+        "lastHeld": None,
+        "observedHeights": 0,
+        "lapseEvents": 0,
+        "lapseHeights": 0,
+        "lastLapseHeight": None,
+        "lastRecoveryHeight": None,
+        "lastLapseCountedHeight": None,
+        "currentLapseHeights": 0,
+        "longestLapseHeights": 0,
+    }
+
+
+def load_nisp_history(path):
+    state = empty_nisp_history()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict) and saved.get("version") == 1:
+            state.update(saved)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        # A damaged state file must never stop the dashboard.
+        pass
+    return state
+
+
+def save_nisp_history(path, state):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def update_nisp_history(path, workers):
+    state = load_nisp_history(path)
+    nisp = workers.get("nisp") or {}
+
+    height = integer(nisp.get("atHeight"))
+    if height <= 0:
+        return state
+
+    held = bool(nisp.get("held"))
+    now_ms = integer(workers.get("observedAt"), int(time.time() * 1000))
+
+    last_height = state.get("lastHeight")
+    last_held = state.get("lastHeld")
+
+    if state.get("trackingStartedHeight") is None:
+        state["trackingStartedHeight"] = height
+        state["trackingStartedAt"] = now_ms
+        state["observedHeights"] = 1
+    elif last_height is not None and height > integer(last_height):
+        # Count unique forward-moving heights. If polling ever skips a height,
+        # do not guess whether that unseen height was held or unheld.
+        state["observedHeights"] = integer(state.get("observedHeights")) + 1
+
+    entered_lapse = (
+        not held
+        and (last_held is None or bool(last_held))
+    )
+
+    if entered_lapse:
+        state["lapseEvents"] = integer(state.get("lapseEvents")) + 1
+        state["lastLapseHeight"] = height
+
+    if not held:
+        # Count each height at most once even when it is polled repeatedly.
+        if state.get("lastLapseCountedHeight") != height:
+            state["lapseHeights"] = integer(state.get("lapseHeights")) + 1
+            state["lastLapseCountedHeight"] = height
+
+            if (
+                last_height is not None
+                and integer(last_height) == height - 1
+                and last_held is False
+            ):
+                state["currentLapseHeights"] = (
+                    integer(state.get("currentLapseHeights")) + 1
+                )
+            else:
+                state["currentLapseHeights"] = 1
+
+            state["longestLapseHeights"] = max(
+                integer(state.get("longestLapseHeights")),
+                integer(state.get("currentLapseHeights")),
+            )
+    else:
+        if last_held is False:
+            state["lastRecoveryHeight"] = height
+        state["currentLapseHeights"] = 0
+
+    # Do not move the persistent cursor backwards across a short reorg.
+    if last_height is None or height >= integer(last_height):
+        state["lastHeight"] = height
+        state["lastHeld"] = held
+
+    state["lastObservedAt"] = now_ms
+    save_nisp_history(path, state)
+    return state
+
+
+def render_nisp_history(state):
+    observed = integer(state.get("observedHeights"))
+    lapse_heights = integer(state.get("lapseHeights"))
+    events = integer(state.get("lapseEvents"))
+    current = integer(state.get("currentLapseHeights"))
+    longest = integer(state.get("longestLapseHeights"))
+
+    clean_pct = (
+        100.0 * max(0, observed - lapse_heights) / observed
+        if observed else 100.0
+    )
+
+    kv(
+        "NISP lapse events",
+        col(f"{events:,}", GREEN if events == 0 else YELLOW)
+    )
+
+    kv(
+        "Heights with lapse",
+        col(
+            f"{lapse_heights:,} / {observed:,} observed  ({clean_pct:.2f}% clean)",
+            GREEN if lapse_heights == 0 else YELLOW
+        )
+    )
+
+    if current:
+        kv(
+            "Current lapse",
+            col(f"{current:,} observed height(s)", RED, BOLD)
+        )
+
+    kv(
+        "Longest lapse",
+        col(
+            f"{longest:,} observed height(s)",
+            GREEN if longest == 0 else YELLOW
+        )
+    )
+
+    started = state.get("trackingStartedHeight")
+    if started:
+        kv("NISP tracking since", f"height {integer(started):,}")
+
+    last_lapse = state.get("lastLapseHeight")
+    if last_lapse:
+        kv("Last lapse observed", f"height {integer(last_lapse):,}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Render current mining state
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -227,7 +402,7 @@ def render_commitment(c):
         kv("Commit control", col(blocked, YELLOW))
 
 
-def render_workers(w):
+def render_workers(w, nisp_history):
     accepted = integer(w.get("acceptedShares"))
     rejected = integer(w.get("rejectedShares"))
     supers = integer(w.get("superShares"))
@@ -282,6 +457,9 @@ def render_workers(w):
                 color
             )
         )
+
+    print()
+    render_nisp_history(nisp_history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,9 +771,10 @@ def fetch_buckets(base, days):
         )
 
 
-def render(base, days, refresh):
+def render(base, days, refresh, nisp_state_file):
     commitment = api_get(base, "/mining/commitment")
     workers = api_get(base, "/stats/mining/workers")
+    nisp_history = update_nisp_history(nisp_state_file, workers)
     totals_doc = api_get(base, "/stats/mining/totals")
     bucket_doc = fetch_buckets(base, days)
 
@@ -643,7 +822,7 @@ def render(base, days, refresh):
     render_commitment(commitment)
 
     section("CURRENT SHARE SESSION")
-    render_workers(workers)
+    render_workers(workers, nisp_history)
 
     section("POOL / NETWORK ECONOMICS")
     print(
@@ -717,6 +896,18 @@ def main():
     )
 
     parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Persistent NISP history file (default: XDG state directory)"
+    )
+
+    parser.add_argument(
+        "--reset-nisp-history",
+        action="store_true",
+        help="Reset persistent NISP lapse history before starting"
+    )
+
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Render once and exit"
@@ -738,6 +929,13 @@ def main():
 
     interval = max(1, args.interval)
     days = max(1, min(args.days, 30))
+    nisp_state_file = args.state_file or default_nisp_state_file()
+
+    if args.reset_nisp_history:
+        try:
+            os.remove(nisp_state_file)
+        except FileNotFoundError:
+            pass
 
     if USE_COLOR:
         print(HIDE_CURSOR, end="", flush=True)
@@ -745,7 +943,7 @@ def main():
     try:
         while True:
             try:
-                render(args.url, days, interval)
+                render(args.url, days, interval, nisp_state_file)
 
             except Exception as exc:
                 print(CLEAR_HOME, end="")

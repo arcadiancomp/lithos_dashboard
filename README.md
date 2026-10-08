@@ -12,6 +12,7 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 - Commitment activation and lock countdowns
 - Accepted/rejected super-share monitoring
 - NISP health and remaining coverage
+- Persistent NISP lapse and reliability tracking across restarts
 - Pool and network economic statistics
 - Lithos block counts
 - Initial holding value
@@ -92,6 +93,15 @@ Disable ANSI colors:
 
 ```bash
 lithos_dashboard --no-color
+```
+
+NISP reliability history is persisted under the user's XDG state directory
+(default: `~/.local/state/lithos_dashboard/nisp_history.json`).
+
+Reset the NISP reliability counters:
+
+```bash
+lithos_dashboard --reset-nisp-history
 ```
 
 ## Economics

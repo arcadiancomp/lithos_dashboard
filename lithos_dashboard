@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+
+RED     = "\033[31m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+BLUE    = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN    = "\033[36m"
+WHITE   = "\033[37m"
+
+BG_GREEN  = "\033[42m"
+BG_YELLOW = "\033[43m"
+BG_RED    = "\033[41m"
+
+CLEAR_HOME = "\033[2J\033[H"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+
+USE_COLOR = True
+
+
+def col(text, *codes):
+    text = str(text)
+    if not USE_COLOR:
+        return text
+    return "".join(codes) + text + RESET
+
+
+def badge(text, state="neutral"):
+    if state == "good":
+        return col(f" {text} ", BOLD, BG_GREEN, "\033[30m")
+    if state == "warn":
+        return col(f" {text} ", BOLD, BG_YELLOW, "\033[30m")
+    if state == "bad":
+        return col(f" {text} ", BOLD, BG_RED, WHITE)
+    return col(f" {text} ", BOLD, BLUE)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+NANO = Decimal("1000000000")
+
+
+def dec(v, default="0"):
+    try:
+        if v is None:
+            return Decimal(default)
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(default)
+
+
+def integer(v, default=0):
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def erg(totals, key):
+    return dec(totals.get(key, "0")) / NANO
+
+
+def num(totals, key):
+    return integer(totals.get(key, "0"))
+
+
+def fmt_erg(v, places=3):
+    v = dec(v)
+    if abs(v) >= Decimal("1000"):
+        return f"{v:,.1f}"
+    return f"{v:,.{places}f}"
+
+
+def fmt_rate(v):
+    v = dec(v)
+    return f"{v:,.2f}"
+
+
+def fmt_pct(v):
+    return f"{float(v):+.1f}%"
+
+
+def api_get(base, path, params=None, timeout=4):
+    url = base.rstrip("/") + path
+
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json"}
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def ms_date(ms):
+    if not ms:
+        return "-"
+    return datetime.fromtimestamp(
+        int(ms) / 1000,
+        tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+
+
+def ms_datetime(ms):
+    if not ms:
+        return "-"
+    return datetime.fromtimestamp(
+        int(ms) / 1000,
+        tz=timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def hr(char="─"):
+    width = shutil.get_terminal_size((150, 40)).columns
+    width = max(90, min(width, 180))
+    return col(char * width, DIM)
+
+
+def section(title):
+    print()
+    print(col(f"  {title}", BOLD, CYAN))
+    print(hr())
+
+
+def kv(label, value, label_width=28):
+    print(
+        "  "
+        + col(f"{label:<{label_width}}", DIM)
+        + str(value)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Render current mining state
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_commitment(c):
+    state = str(c.get("state", "unknown"))
+    height = integer(c.get("height"))
+    config_diff = c.get("configDiff", "-")
+    can_commit = c.get("canCommit", False)
+    blocked = c.get("blockedReason")
+
+    if state == "active":
+        state_badge = badge("ACTIVE", "good")
+    elif state in ("waiting", "registering"):
+        state_badge = badge(state.upper(), "warn")
+    else:
+        state_badge = badge(state.upper(), "bad")
+
+    kv("Commitment state", state_badge)
+    kv("Chain height", col(f"{height:,}", BOLD, WHITE))
+    kv("Configured difficulty", col(config_diff, BOLD, CYAN))
+
+    inflight = c.get("inFlight")
+    pending = c.get("pending")
+    inforce = c.get("inForce")
+
+    if inforce:
+        kv(
+            "In-force difficulty",
+            col(inforce.get("diff", "-"), BOLD, GREEN)
+        )
+
+    if pending:
+        served = integer(pending.get("servedFromHeight"))
+        force = integer(pending.get("inForceFromHeight"))
+
+        kv(
+            "Pending difficulty",
+            col(pending.get("diff", "-"), BOLD, YELLOW)
+        )
+
+        if served:
+            remain = max(0, served - height)
+            color = GREEN if remain == 0 else YELLOW
+            kv(
+                "Stratum serves in",
+                col(f"{remain:,} blocks  @ {served:,}", color)
+            )
+
+        if force:
+            remain = max(0, force - height)
+            color = GREEN if remain == 0 else YELLOW
+            kv(
+                "In force in",
+                col(f"{remain:,} blocks  @ {force:,}", color)
+            )
+
+    if inflight:
+        kv("In-flight commitment", col(str(inflight), YELLOW))
+
+    replaceable = integer(c.get("replaceableFromHeight"))
+    if replaceable:
+        remaining = max(0, replaceable - height)
+        kv(
+            "Next change allowed",
+            f"{remaining:,} blocks  @ {replaceable:,}"
+        )
+
+    if not can_commit and blocked:
+        kv("Commit control", col(blocked, YELLOW))
+
+
+def render_workers(w):
+    accepted = integer(w.get("acceptedShares"))
+    rejected = integer(w.get("rejectedShares"))
+    supers = integer(w.get("superShares"))
+    sph = dec(w.get("superSharesPerHour"))
+    candidates = integer(w.get("blockCandidates"))
+
+    nisp = w.get("nisp") or {}
+    held = bool(nisp.get("held"))
+    nisp_count = integer(nisp.get("superSharesInWindow"))
+    required = integer(nisp.get("required"), 10)
+    blocks_remaining = nisp.get("blocksRemaining")
+    valid_through = nisp.get("validThroughHeight")
+
+    if rejected == 0:
+        share_text = (
+            col(f"{accepted:,} accepted", GREEN, BOLD)
+            + " / "
+            + col("0 rejected", GREEN)
+        )
+    else:
+        share_text = (
+            col(f"{accepted:,} accepted", GREEN)
+            + " / "
+            + col(f"{rejected:,} rejected", RED, BOLD)
+        )
+
+    kv("Shares this session", share_text)
+    kv("Super shares", col(f"{supers:,}", BOLD, CYAN))
+    kv("Super shares / hour", col(fmt_rate(sph), BOLD, CYAN))
+
+    if candidates:
+        kv("Block candidates", col(f"{candidates:,}", MAGENTA))
+
+    if held:
+        nisp_text = badge("NISP HELD", "good")
+    else:
+        nisp_text = badge("NISP NOT HELD", "bad")
+
+    nisp_text += f"   {nisp_count}/{required}"
+    kv("NISP status", nisp_text)
+
+    if blocks_remaining is not None:
+        color = GREEN if integer(blocks_remaining) >= 15 else YELLOW
+        kv(
+            "NISP coverage",
+            col(
+                f"{integer(blocks_remaining)} blocks remaining"
+                + (
+                    f"  through {integer(valid_through):,}"
+                    if valid_through else ""
+                ),
+                color
+            )
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network / pool economics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def economics(t):
+    lithos_blocks = num(t, "lithos.blocks")
+    chain_blocks = num(t, "chain.blocks")
+
+    genesis = erg(t, "holding.genesisNanoErg")
+    topup = erg(t, "rollup.topUp.valueNanoErg")
+    priority = erg(t, "lithos.priorityFeeNanoErg")
+
+    payout_reward = erg(t, "network.payout.rewardNanoErg")
+    payout_gross = erg(t, "network.payout.grossNanoErg")
+
+    dex_lithos_gross = erg(t, "batching.lithosdex.grossNanoErg")
+    dex_ergo_gross = erg(t, "batching.ergodex.grossNanoErg")
+    dex_gross = dex_lithos_gross + dex_ergo_gross
+
+    dex_lithos_net = erg(t, "batching.lithosdex.afterTransactionFeesNanoErg")
+    dex_ergo_net = erg(t, "batching.ergodex.afterTransactionFeesNanoErg")
+    dex_net = dex_lithos_net + dex_ergo_net
+
+    pool_dex = (
+        erg(t, "pool.batching.lithosdex.grossNanoErg")
+        + erg(t, "pool.batching.ergodex.grossNanoErg")
+    )
+
+    local_dex_net = (
+        erg(t, "local.batching.lithosdex.afterTransactionFeesNanoErg")
+        + erg(t, "local.batching.ergodex.afterTransactionFeesNanoErg")
+    )
+
+    local_payout = erg(t, "local.payout.rewardNanoErg")
+
+    other_topup = max(Decimal(0), topup - pool_dex)
+
+    initial_per_block = (
+        genesis / lithos_blocks
+        if lithos_blocks else Decimal(0)
+    )
+
+    topup_per_block = (
+        topup / lithos_blocks
+        if lithos_blocks else Decimal(0)
+    )
+
+    inflow_per_block = (
+        (genesis + topup) / lithos_blocks
+        if lithos_blocks else Decimal(0)
+    )
+
+    boost = (
+        topup / genesis * Decimal(100)
+        if genesis else Decimal(0)
+    )
+
+    return {
+        "lithos_blocks": lithos_blocks,
+        "chain_blocks": chain_blocks,
+        "genesis": genesis,
+        "topup": topup,
+        "priority": priority,
+        "payout_reward": payout_reward,
+        "payout_gross": payout_gross,
+        "dex_gross": dex_gross,
+        "dex_net": dex_net,
+        "pool_dex": pool_dex,
+        "local_dex_net": local_dex_net,
+        "local_payout": local_payout,
+        "other_topup": other_topup,
+        "initial_per_block": initial_per_block,
+        "topup_per_block": topup_per_block,
+        "inflow_per_block": inflow_per_block,
+        "boost": boost,
+    }
+
+
+def render_economics(e, span_days):
+    kv(
+        "Lithos blocks",
+        col(f"{e['lithos_blocks']:,}", BOLD, WHITE)
+    )
+
+    kv(
+        "Initial holding",
+        col(f"{fmt_erg(e['genesis'])} ERG", BOLD, CYAN)
+    )
+
+    kv(
+        "Candidate top-ups",
+        col(f"{fmt_erg(e['topup'])} ERG", BOLD, GREEN)
+    )
+
+    if e["genesis"] > 0:
+        boost_color = GREEN if e["boost"] > 0 else WHITE
+        kv(
+            "Top-up boost",
+            col(fmt_pct(e["boost"]), BOLD, boost_color)
+            + " vs initial holdings"
+        )
+
+    kv(
+        "Initial / Lithos block",
+        f"{fmt_erg(e['initial_per_block'])} ERG"
+    )
+
+    kv(
+        "Top-up / Lithos block",
+        col(f"{fmt_erg(e['topup_per_block'])} ERG", GREEN)
+    )
+
+    kv(
+        "Holding inflow / block",
+        col(
+            f"{fmt_erg(e['inflow_per_block'])} ERG",
+            BOLD,
+            GREEN
+        )
+    )
+
+    print()
+
+    kv(
+        "Priority bids observed",
+        f"{fmt_erg(e['priority'])} ERG"
+    )
+
+    kv(
+        "DEX gross executor fees",
+        f"{fmt_erg(e['dex_gross'])} ERG"
+    )
+
+    kv(
+        "DEX after tx fees",
+        f"{fmt_erg(e['dex_net'])} ERG"
+    )
+
+    kv(
+        "DEX revenue into pool",
+        f"{fmt_erg(e['pool_dex'])} ERG"
+    )
+
+    kv(
+        "Other candidate top-up",
+        col(f"{fmt_erg(e['other_topup'])} ERG", MAGENTA)
+        + col("  (rent / other candidate revenue)", DIM)
+    )
+
+    print()
+
+    kv(
+        "Network payout rewards",
+        f"{fmt_erg(e['payout_reward'])} ERG"
+    )
+
+    kv(
+        "Local realized payout",
+        col(
+            f"{fmt_erg(e['local_payout'])} ERG",
+            BOLD,
+            GREEN if e["local_payout"] > 0 else YELLOW
+        )
+    )
+
+    kv(
+        "Local direct DEX net",
+        col(
+            f"{fmt_erg(e['local_dex_net'])} ERG",
+            GREEN if e["local_dex_net"] > 0 else WHITE
+        )
+    )
+
+    if span_days > 0:
+        kv(
+            "Retained history span",
+            f"{span_days:.2f} days"
+        )
+
+        if e["lithos_blocks"]:
+            kv(
+                "Lithos blocks / day",
+                f"{e['lithos_blocks'] / span_days:.2f}"
+            )
+
+        kv(
+            "Pool top-ups / day",
+            col(
+                f"{float(e['topup']) / span_days:.3f} ERG/day",
+                GREEN
+            )
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_daily(buckets):
+    print(
+        "  "
+        + col(f"{'UTC DATE':<11}", BOLD)
+        + col(f"{'CHAIN':>7}", BOLD)
+        + col(f"{'LITHOS':>8}", BOLD)
+        + col(f"{'GENESIS':>11}", BOLD)
+        + col(f"{'TOP-UP':>11}", BOLD)
+        + col(f"{'BOOST':>9}", BOLD)
+        + col(f"{'PRIORITY':>11}", BOLD)
+        + col(f"{'DEX GROSS':>11}", BOLD)
+        + col(f"{'PAYOUT':>11}", BOLD)
+    )
+
+    print("  " + col("─" * 90, DIM))
+
+    if not buckets:
+        print(col("  No daily buckets retained.", YELLOW))
+        return
+
+    for b in buckets:
+        t = b.get("totals") or {}
+
+        chain = num(t, "chain.blocks")
+        lb = num(t, "lithos.blocks")
+
+        genesis = erg(t, "holding.genesisNanoErg")
+        topup = erg(t, "rollup.topUp.valueNanoErg")
+        priority = erg(t, "lithos.priorityFeeNanoErg")
+
+        dex = (
+            erg(t, "batching.lithosdex.grossNanoErg")
+            + erg(t, "batching.ergodex.grossNanoErg")
+        )
+
+        payout = erg(t, "network.payout.rewardNanoErg")
+
+        boost = (
+            topup / genesis * Decimal(100)
+            if genesis else Decimal(0)
+        )
+
+        date = ms_date(b.get("start"))
+
+        if lb > 0:
+            date_s = col(f"{date:<11}", WHITE)
+            lithos_s = col(f"{lb:>8}", CYAN, BOLD)
+        else:
+            date_s = col(f"{date:<11}", DIM)
+            lithos_s = col(f"{lb:>8}", DIM)
+
+        if topup > 0:
+            topup_s = col(f"{fmt_erg(topup):>11}", GREEN)
+            boost_s = col(f"{fmt_pct(boost):>9}", GREEN)
+        else:
+            topup_s = col(f"{'0.000':>11}", DIM)
+            boost_s = col(f"{'-':>9}", DIM)
+
+        payout_color = GREEN if payout > 0 else DIM
+
+        print(
+            "  "
+            + date_s
+            + f"{chain:>7}"
+            + lithos_s
+            + f"{fmt_erg(genesis):>11}"
+            + topup_s
+            + boost_s
+            + f"{fmt_erg(priority):>11}"
+            + f"{fmt_erg(dex):>11}"
+            + col(f"{fmt_erg(payout):>11}", payout_color)
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main frame
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_buckets(base, days):
+    now = datetime.now(timezone.utc)
+
+    today = datetime(
+        now.year, now.month, now.day,
+        tzinfo=timezone.utc
+    )
+
+    start = today - timedelta(days=max(1, days - 1))
+    end = today + timedelta(days=1)
+
+    params = {
+        "from": int(start.timestamp() * 1000),
+        "until": int(end.timestamp() * 1000),
+        "interval": "day",
+    }
+
+    try:
+        return api_get(
+            base,
+            "/stats/mining/buckets",
+            params=params
+        )
+    except Exception:
+        # Conservative fallback: complete days only.
+        params["until"] = int(today.timestamp() * 1000)
+        return api_get(
+            base,
+            "/stats/mining/buckets",
+            params=params
+        )
+
+
+def render(base, days, refresh):
+    commitment = api_get(base, "/mining/commitment")
+    workers = api_get(base, "/stats/mining/workers")
+    totals_doc = api_get(base, "/stats/mining/totals")
+    bucket_doc = fetch_buckets(base, days)
+
+    totals = totals_doc.get("totals") or {}
+    econ = economics(totals)
+
+    from_ts = integer(totals_doc.get("fromTimestamp"))
+    observed = integer(totals_doc.get("observedAt"))
+
+    span_days = 0.0
+    if from_ts and observed and observed > from_ts:
+        span_days = (observed - from_ts) / 86400000.0
+
+    source_height = integer(totals_doc.get("sourceHeight"))
+    target_height = integer(totals_doc.get("targetHeight"))
+
+    print(CLEAR_HOME, end="")
+
+    now_local = datetime.now().astimezone()
+
+    print(
+        col(" LITHOS MINING + SEQUENCER DASHBOARD ", BOLD, WHITE, BLUE)
+        + "   "
+        + col(now_local.strftime("%Y-%m-%d %H:%M:%S %Z"), BOLD)
+    )
+
+    print(
+        col(" API ", DIM)
+        + f" {base}"
+        + col("   │   refresh ", DIM)
+        + f"{refresh}s"
+        + col("   │   source height ", DIM)
+        + f"{source_height:,}"
+    )
+
+    if target_height and target_height != source_height:
+        print(
+            col(
+                f" Stats collector lag: {target_height - source_height} block(s)",
+                YELLOW
+            )
+        )
+
+    section("MINER STATE")
+    render_commitment(commitment)
+
+    section("CURRENT SHARE SESSION")
+    render_workers(workers)
+
+    section("POOL / NETWORK ECONOMICS")
+    print(
+        col(
+            "  These figures describe the Lithos network/pool retained history, "
+            "not all of them are your personal income.",
+            YELLOW
+        )
+    )
+    print()
+    render_economics(econ, span_days)
+
+    section(f"DAILY HISTORY — LAST {days} UTC DAYS")
+    render_daily(bucket_doc.get("buckets") or [])
+
+    print()
+    print(hr())
+    print(
+        "  "
+        + col("Green", GREEN, BOLD)
+        + " = healthy / revenue   "
+        + col("Yellow", YELLOW, BOLD)
+        + " = pending / caution   "
+        + col("Red", RED, BOLD)
+        + " = problem   "
+        + col("Magenta", MAGENTA, BOLD)
+        + " = candidate revenue not identified as pool DEX"
+    )
+
+    if bucket_doc.get("partial"):
+        print(
+            col(
+                "  Daily range is partial because retained history does not cover the entire requested window.",
+                DIM
+            )
+        )
+
+    print(
+        col(
+            "  Ctrl-C exits. Values update in place.",
+            DIM
+        )
+    )
+
+
+def main():
+    global USE_COLOR
+
+    parser = argparse.ArgumentParser(
+        description="Lithos mining/sequencer terminal dashboard"
+    )
+
+    parser.add_argument(
+        "--url",
+        default="http://127.0.0.1:9000",
+        help="Lithos HTTP API base URL"
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=15,
+        help="Refresh interval in seconds (default: 15)"
+    )
+
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Daily history window (default: 7)"
+    )
+
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Render once and exit"
+    )
+
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors"
+    )
+
+    args = parser.parse_args()
+
+    USE_COLOR = (
+        not args.no_color
+        and sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+    )
+
+    interval = max(1, args.interval)
+    days = max(1, min(args.days, 30))
+
+    if USE_COLOR:
+        print(HIDE_CURSOR, end="", flush=True)
+
+    try:
+        while True:
+            try:
+                render(args.url, days, interval)
+
+            except Exception as exc:
+                print(CLEAR_HOME, end="")
+                print(
+                    col(
+                        " LITHOS DASHBOARD ERROR ",
+                        BOLD,
+                        WHITE,
+                        BG_RED
+                    )
+                )
+                print()
+                print(f"  {type(exc).__name__}: {exc}")
+                print()
+                print(
+                    col(
+                        f"  Retrying in {interval} seconds...",
+                        YELLOW
+                    )
+                )
+
+            if args.once:
+                break
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        if USE_COLOR:
+            print(SHOW_CURSOR, end="", flush=True)
+        print()
+
+
+if __name__ == "__main__":
+    main()

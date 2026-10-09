@@ -38,7 +38,7 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -1502,6 +1502,167 @@ def render_economics(e, span_days):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Local mining income projections (ERG and LIT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+LIT_BASE_UNITS = Decimal(1000000000)  # Confirmed mainnet LIT: 9 decimals
+
+
+def income_median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    if n % 2:
+        return ordered[n // 2]
+    return (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+
+
+def calculate_monthly_income(totals, ledger, span_days):
+    """A conditional *gross* 30-day model from local paid and pending claims.
+
+    The retained-history submission count estimates future eligible-claim frequency.
+    Typical ERG per claim is the median of confirmed rewards and evaluation/payout
+    estimates (robust to the currently observed exceptional evaluation claim).
+    The all-claims scenario uses the arithmetic mean including exceptional claims.
+    LIT projections use confirmed LIT rewards only; holding claims are unpriced.
+    No bond refunds, pool-wide revenue or USD conversion enter these estimates.
+    """
+    if not isinstance(ledger, dict) or ledger.get("error"):
+        return {"error": safe_text((ledger or {}).get("error", "unavailable"))}
+    if ledger.get("status") != "ready":
+        return {"error": "payment ledger not ready"}
+    if span_days < 1:
+        return {"error": "need at least one day of retained statistics"}
+
+    local_submissions = num(totals, "rollup.submission.localCount")
+    payments = ledger.get("payments") or []
+    claims = ledger.get("claims") or []
+    if not isinstance(payments, list) or not isinstance(claims, list):
+        return {"error": "invalid payment ledger response"}
+    if integer(ledger.get("total")) > len(payments):
+        return {"error": "payout history exceeds one API page (500)"}
+
+    paid_erg = []
+    paid_lit = []
+    for payment in payments:
+        if not isinstance(payment, dict):
+            continue
+        paid_erg.append(max(Decimal(0), dec(payment.get("rewardNanoErg"))) / NANO
+                        + max(Decimal(0), dec(payment.get("surplusNanoErg"))) / NANO)
+        if payment.get("rewardLit") is not None:
+            paid_lit.append(max(Decimal(0), dec(payment["rewardLit"])) / LIT_BASE_UNITS)
+
+    evaluated = []
+    exact_pending = Decimal(0)
+    pending_erg = Decimal(0)
+    holding = 0
+    slashed = 0
+    eval_count = 0
+    exact_count = 0
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        phase = claim.get("phase")
+        if phase == "slashed":
+            slashed += 1
+            continue
+        if phase == "holding":
+            holding += 1
+            continue
+        reward = claim.get("rewardNanoErg")
+        if phase in ("evaluation", "payout") and reward is not None:
+            value = max(Decimal(0), dec(reward)) / NANO
+            evaluated.append(value)
+            pending_erg += value
+            if phase == "payout" or claim.get("rewardBasis") == "exact":
+                exact_pending += value
+                exact_count += 1
+            else:
+                eval_count += 1
+        else:
+            holding += 1
+
+    # Use the ledger only for sample distribution, and accounting totals for
+    # the full local retained-history rewards (handles reconciliation/reorgs).
+    confirmed_erg = erg(totals, "local.payout.rewardNanoErg") + erg(
+        totals, "local.payout.surplusNanoErg")
+    confirmed_lit = dec(totals.get("local.payout.rewardLit")) / LIT_BASE_UNITS
+    confirmed_count = num(totals, "local.payout.outputs")
+    sample = paid_erg + evaluated
+    sample_median = income_median(sample)
+    lit_median = income_median(paid_lit)
+    claims_per_month = (Decimal(local_submissions) * Decimal(30)
+                        / Decimal(str(span_days)))
+
+    estimate = {
+        "confirmedErg": confirmed_erg,
+        "confirmedLit": confirmed_lit,
+        "confirmedCount": confirmed_count,
+        "pendingErg": pending_erg,
+        "pendingExactErg": exact_pending,
+        "pendingEvaluationCount": eval_count,
+        "pendingExactCount": exact_count,
+        "holdingCount": holding,
+        "slashedCount": slashed,
+        "localSubmissions": local_submissions,
+        "claimsPerMonth": claims_per_month,
+        "paidSample": len(paid_erg),
+        "valuedClaims": len(evaluated),
+        "spanDays": span_days,
+        "baselineErgMonth": sample_median * claims_per_month
+            if sample_median is not None and local_submissions else None,
+        "allClaimsErgMonth": (sum(sample) / Decimal(len(sample))) * claims_per_month
+            if sample and local_submissions else None,
+        "litMonth": lit_median * claims_per_month
+            if lit_median is not None and local_submissions else None,
+        "confidence": "LOW" if len(paid_erg) < 10 or span_days < 7 else (
+            "LIMITED" if len(paid_erg) < 30 or span_days < 21 else "MODERATE"),
+    }
+    return estimate
+
+
+def render_income_projection(model, wide):
+    if model.get("error"):
+        section("PROJECTED MONTHLY MINING INCOME")
+        print(col("  Unavailable: " + safe_text(model["error"]), YELLOW))
+        return
+
+    def shown(value, unit, decimals=2):
+        return (f"~{value:,.{decimals}f} {unit}/mo"
+                if value is not None else "insufficient data")
+
+    left = [
+        compact_kv("Typical ERG / 30d", col(
+            shown(model["baselineErgMonth"], "ERG"), BOLD, GREEN)),
+        compact_kv("All claims ERG / 30d", col(
+            shown(model["allClaimsErgMonth"], "ERG"), CYAN)),
+        compact_kv("LIT / 30d", col(shown(model["litMonth"], "LIT", 1), BOLD, CYAN)),
+        compact_kv("Claims / 30d", f"~{model['claimsPerMonth']:.1f}"),
+        compact_kv("Model confidence", col(model["confidence"], YELLOW)),
+    ]
+    right = [
+        compact_kv("Confirmed rewards", col(
+            f"{model['confirmedErg']:.6f} ERG  +  {model['confirmedLit']:.6f} LIT", GREEN)),
+        compact_kv("Confirmed payouts", str(model["confirmedCount"])),
+        compact_kv("Pending ERG claims", col(f"{model['pendingErg']:.6f} ERG", YELLOW)),
+        compact_kv("Claim phases", f"{model['pendingEvaluationCount']} eval / "
+                   f"{model['pendingExactCount']} exact / {model['holdingCount']} holding"),
+        compact_kv("ERG model samples", f"{model['paidSample']} paid + "
+                   f"{model['valuedClaims']} priced open"),
+    ]
+    if wide:
+        print_columns("PROJECTED MONTHLY INCOME", left,
+                      "CONFIRMED + PENDING REWARDS", right)
+    else:
+        section("PROJECTED MONTHLY MINING INCOME")
+        for item in left + right:
+            print(item)
+    print(col("  Gross conditional estimates; evaluation rewards can change; "
+              "bond refunds excluded; LIT has no USD valuation.", DIM))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Wide / low-height layout
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2050,6 +2211,12 @@ def render(
     bucket_doc = fetch_buckets(base, days)
 
     try:
+        payment_ledger = api_get(base, "/stats/mining/payments",
+                                 params={"limit": 500})
+    except Exception as exc:
+        payment_ledger = {"error": safe_text(exc)}
+
+    try:
         difficulty_doc = api_get(base, "/stats/mining/difficulty")
     except Exception:
         difficulty_doc = {}
@@ -2111,6 +2278,10 @@ def render(
         + f"{source_height:,}"
     )
 
+    income_model = calculate_monthly_income(
+        totals, payment_ledger, span_days
+    )
+
     if target_height and target_height != source_height:
         print(
             col(
@@ -2151,6 +2322,10 @@ def render(
         )
         print()
         render_economics(econ, span_days)
+
+    render_income_projection(
+        income_model, terminal_columns >= WIDE_LAYOUT_MIN_COLUMNS
+    )
 
     section(f"DAILY HISTORY — LAST {days} UTC DAYS")
     render_daily(bucket_doc.get("buckets") or [])

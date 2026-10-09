@@ -28,6 +28,8 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 - Priority-bid revenue
 - ErgoDEX and LithosDEX executor revenue
 - Local realized payout tracking
+- 30-day conditional ERG and LIT income projections from local paid and open claims
+- Separate confirmed mining rewards, priced pending claims, and unpriced holdings
 - Local direct DEX executor income
 - Daily historical revenue table
 - ANSI color-coded terminal display
@@ -195,6 +197,31 @@ protocol fingerprint.
 
 The Ergo node should have its extra index enabled so historical transaction
 lookups are available.
+
+## Projected monthly mining income (v0.1.4)
+
+The income panel uses the client's own `/stats/mining/payments` ledger and the
+retained local NISP submission count. It never treats network-wide rewards or
+refunded submission bonds as your personal earnings.
+
+- **Typical ERG / 30d:** local submissions per retained day, scaled to 30 days,
+  multiplied by the **median** reward among confirmed payouts and priced
+  evaluation/payout claims. Median avoids allowing a single unusually large
+  unfinalized claim to dominate the baseline.
+- **All claims ERG / 30d:** uses the **mean** of the same rewards, including
+  unusual projected claims. This is an alternate scenario, not an upper bound.
+- **LIT / 30d:** uses the median **confirmed** LIT reward per payout only;
+  each raw LIT amount has nine decimal places. No LIT-to-USD conversion.
+- **Confirmed:** cumulative local ERG reward and surplus, plus local LIT reward;
+  excludes returned ERG bonds.
+- **Pending:** sums evaluation/payout-phase ERG claims, with provisional values
+  potentially changing through fraud-proof evaluation. Holding claims are
+  counted but not priced. Slashed claims are not included in projected rewards.
+
+The claim rate is based on retained local NISP submissions, which can span
+multiple commitment settings. The model is conditional, not a guarantee, and
+is especially uncertain with only a few mature payouts. It excludes electricity,
+transaction fees, slashing losses, direct DEX fees and speculative LIT prices.
 
 ## Economics
 

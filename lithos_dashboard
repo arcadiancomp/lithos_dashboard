@@ -37,7 +37,7 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -802,6 +802,458 @@ def render_workers(w, nisp_history, opportunity_estimate):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ergo network / Lithos adoption tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+ADOPTION_WINDOWS = (100, 500, 1000)
+ADOPTION_MAX_BLOCKS = max(ADOPTION_WINDOWS)
+CHAIN_SLICE_BATCH = 128
+
+
+def default_adoption_state_file():
+    root = os.environ.get("XDG_STATE_HOME")
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(
+        root,
+        "lithos_dashboard",
+        "adoption_history.json"
+    )
+
+
+def empty_adoption_state():
+    return {
+        "version": 1,
+        "holdingErgoTree": None,
+        "lastTip": None,
+        "records": {},
+    }
+
+
+def load_adoption_state(path):
+    state = empty_adoption_state()
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+
+        if isinstance(saved, dict) and saved.get("version") == 1:
+            state.update(saved)
+
+        if not isinstance(state.get("records"), dict):
+            state["records"] = {}
+
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        pass
+
+    return state
+
+
+def save_adoption_state(path, state):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    tmp = path + ".tmp"
+
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def discover_holding_tree(node_base, stats_doc, state):
+    """
+    Learn the canonical Lithos Holding ErgoTree from a confirmed genesis
+    transaction reported by the local Lithos client.
+
+    Once learned it is persisted, so a temporary lack of recent Lithos blocks
+    does not disable network adoption tracking.
+    """
+    mining = (stats_doc or {}).get("mining") or {}
+    blocks = mining.get("blocks") or []
+
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+
+            txid = safe_text(block.get("transactionId", "")).strip()
+            if not txid:
+                continue
+
+            try:
+                tx = api_get(
+                    node_base,
+                    "/blockchain/transaction/byId/"
+                    + urllib.parse.quote(txid, safe=""),
+                    timeout=8
+                )
+            except Exception:
+                continue
+
+            outputs = tx.get("outputs") or []
+            if not outputs or not isinstance(outputs[0], dict):
+                continue
+
+            tree = safe_text(outputs[0].get("ergoTree", "")).strip()
+            if tree:
+                return tree
+
+    cached = safe_text(state.get("holdingErgoTree") or "").strip()
+    if cached:
+        return cached
+
+    raise ValueError(
+        "cannot learn Lithos Holding contract: no recent confirmed genesis "
+        "is available and no cached fingerprint exists"
+    )
+
+
+def fetch_chain_headers(node_base, start_height, end_height):
+    count = end_height - start_height + 1
+    if count <= 0:
+        return []
+
+    page = api_get(
+        node_base,
+        "/blocks/lastHeaders/" + str(count),
+        timeout=8
+    )
+
+    if not isinstance(page, list):
+        raise ValueError("Ergo lastHeaders returned a non-list response")
+
+    headers = [
+        h for h in page
+        if isinstance(h, dict)
+        and start_height <= integer(h.get("height")) <= end_height
+    ]
+    headers.sort(key=lambda h: integer(h.get("height")))
+
+    if len(headers) != count:
+        raise ValueError(
+            f"Ergo lastHeaders returned {len(headers)} canonical headers; "
+            f"expected {count} for heights {start_height}..{end_height}"
+        )
+
+    return headers
+
+
+def transaction_is_lithos_genesis(tx, holding_tree):
+    if not isinstance(tx, dict):
+        return False
+
+    inputs = tx.get("inputs") or []
+    outputs = tx.get("outputs") or []
+
+    if not inputs or not outputs:
+        return False
+
+    if not isinstance(inputs[0], dict) or not isinstance(outputs[0], dict):
+        return False
+
+    out0 = outputs[0]
+
+    # Every Lithos genesis creates its Holding output at output zero.
+    if safe_text(out0.get("ergoTree", "")) != holding_tree:
+        return False
+
+    assets = out0.get("assets") or []
+    if not assets or not isinstance(assets[0], dict):
+        return False
+
+    # The rollup NFT is minted from input zero's collateral box ID.
+    token_id = safe_text(assets[0].get("tokenId", ""))
+    input_id = safe_text(inputs[0].get("boxId", ""))
+
+    return bool(token_id and input_id and token_id == input_id)
+
+
+def classify_ergo_block(node_base, header, holding_tree):
+    block_id = safe_text(header.get("id", "")).strip()
+    if not block_id:
+        raise ValueError("canonical Ergo header is missing its block id")
+
+    block_txs = api_get(
+        node_base,
+        "/blocks/"
+        + urllib.parse.quote(block_id, safe="")
+        + "/transactions",
+        timeout=8
+    )
+
+    transactions = block_txs.get("transactions") or []
+    is_lithos = any(
+        transaction_is_lithos_genesis(tx, holding_tree)
+        for tx in transactions
+    )
+
+    lender_pk = ""
+    if is_lithos:
+        pow_solutions = header.get("powSolutions") or {}
+        lender_pk = safe_text(pow_solutions.get("pk", "")).strip()
+
+    return {
+        "blockId": block_id,
+        "lithos": bool(is_lithos),
+        "lenderPk": lender_pk,
+    }
+
+
+def network_hashrate_from_difficulty(doc):
+    current = (doc or {}).get("current") or {}
+    hps = dec(current.get("hashesPerSecond"))
+
+    if hps > 0:
+        return hps
+
+    epochs = (doc or {}).get("epochs") or []
+    if isinstance(epochs, list):
+        for epoch in reversed(epochs):
+            if not isinstance(epoch, dict):
+                continue
+            hps = dec(epoch.get("hashesPerSecond"))
+            if hps > 0:
+                return hps
+
+    return Decimal(0)
+
+
+def fmt_hashrate(hps):
+    value = dec(hps)
+
+    units = (
+        (Decimal("1000000000000000"), "PH/s"),
+        (Decimal("1000000000000"), "TH/s"),
+        (Decimal("1000000000"), "GH/s"),
+        (Decimal("1000000"), "MH/s"),
+        (Decimal("1000"), "KH/s"),
+    )
+
+    for scale, name in units:
+        if value >= scale:
+            return f"{value / scale:,.2f} {name}"
+
+    return f"{value:,.0f} H/s"
+
+
+def summarize_adoption(state, network_hps):
+    tip = integer(state.get("lastTip"))
+    records = state.get("records") or {}
+
+    result = {
+        "tip": tip,
+        "networkHashrate": network_hps,
+        "windows": {},
+    }
+
+    for window in ADOPTION_WINDOWS:
+        first = tip - window + 1
+
+        selected = []
+        for height_s, record in records.items():
+            height = integer(height_s)
+            if first <= height <= tip and isinstance(record, dict):
+                selected.append(record)
+
+        scanned = len(selected)
+        lithos = sum(
+            1 for record in selected
+            if bool(record.get("lithos"))
+        )
+
+        lender_keys = {
+            safe_text(record.get("lenderPk", ""))
+            for record in selected
+            if bool(record.get("lithos"))
+            and safe_text(record.get("lenderPk", ""))
+        }
+
+        share = (
+            Decimal(lithos) / Decimal(scanned)
+            if scanned else Decimal(0)
+        )
+
+        result["windows"][window] = {
+            "scanned": scanned,
+            "lithos": lithos,
+            "share": share,
+            "impliedHashrate": network_hps * share,
+            "uniqueLenders": len(lender_keys),
+            "complete": scanned == window,
+        }
+
+    return result
+
+
+def update_network_adoption(
+    node_base,
+    stats_doc,
+    difficulty_doc,
+    state_file
+):
+    """
+    Maintain a canonical rolling 1,000-block classifier.
+
+    First run fetches transaction contents for the entire window. Later runs
+    fetch the 1,000 lightweight headers to verify canonicality, but transaction
+    contents are fetched only for new or reorged block IDs.
+    """
+    state = load_adoption_state(state_file)
+
+    holding_tree = discover_holding_tree(
+        node_base,
+        stats_doc,
+        state
+    )
+
+    old_tree = safe_text(state.get("holdingErgoTree") or "")
+    if old_tree and old_tree != holding_tree:
+        # A protocol contract change invalidates classifications made against
+        # the previous Holding ErgoTree.
+        state["records"] = {}
+        state["lastTip"] = None
+
+    state["holdingErgoTree"] = holding_tree
+
+    info = api_get(node_base, "/info", timeout=8)
+    tip = integer(info.get("fullHeight"))
+
+    if tip <= 0:
+        raise ValueError("Ergo node did not report a usable fullHeight")
+
+    records = state.setdefault("records", {})
+
+    # Nothing on-chain has changed since the previous dashboard refresh.
+    if integer(state.get("lastTip")) == tip and records:
+        return summarize_adoption(
+            state,
+            network_hashrate_from_difficulty(difficulty_doc)
+        )
+
+    start = max(1, tip - ADOPTION_MAX_BLOCKS + 1)
+    headers = fetch_chain_headers(node_base, start, tip)
+
+    canonical_heights = set()
+
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+
+        height = integer(header.get("height"))
+        block_id = safe_text(header.get("id", "")).strip()
+
+        if height <= 0 or not block_id:
+            continue
+
+        canonical_heights.add(height)
+
+        old = records.get(str(height))
+        if (
+            isinstance(old, dict)
+            and safe_text(old.get("blockId", "")) == block_id
+        ):
+            continue
+
+        records[str(height)] = classify_ergo_block(
+            node_base,
+            header,
+            holding_tree
+        )
+
+    # Remove anything outside the rolling window or displaced by a reorg.
+    for height_s in list(records):
+        height = integer(height_s)
+        if (
+            height < start
+            or height > tip
+            or height not in canonical_heights
+        ):
+            records.pop(height_s, None)
+
+    state["lastTip"] = tip
+    save_adoption_state(state_file, state)
+
+    return summarize_adoption(
+        state,
+        network_hashrate_from_difficulty(difficulty_doc)
+    )
+
+
+def render_network_adoption(adoption):
+    error = adoption.get("error")
+    if error:
+        print(
+            col(
+                "  Network adoption unavailable: " + safe_text(error),
+                YELLOW
+            )
+        )
+        return
+
+    network_hps = dec(adoption.get("networkHashrate"))
+
+    if network_hps > 0:
+        kv(
+            "Ergo network hashrate",
+            col(fmt_hashrate(network_hps), BOLD, WHITE)
+            + col("  (current difficulty epoch)", DIM)
+        )
+
+    windows = adoption.get("windows") or {}
+
+    for window in ADOPTION_WINDOWS:
+        row = windows.get(window) or {}
+
+        scanned = integer(row.get("scanned"))
+        lithos = integer(row.get("lithos"))
+        share = dec(row.get("share")) * Decimal(100)
+        lenders = integer(row.get("uniqueLenders"))
+        implied = dec(row.get("impliedHashrate"))
+
+        if share >= Decimal("10"):
+            share_color = GREEN
+        elif share >= Decimal("3"):
+            share_color = CYAN
+        else:
+            share_color = WHITE
+
+        value = (
+            f"{lithos:,} Lithos / {scanned:,}"
+            + "   "
+            + col(f"{share:.2f}%", BOLD, share_color)
+        )
+
+        if network_hps > 0:
+            value += (
+                "   "
+                + col("~" + fmt_hashrate(implied), CYAN)
+            )
+
+        value += f"   {lenders:,} lender"
+        if lenders != 1:
+            value += "s"
+
+        if not bool(row.get("complete")):
+            value += col("  (partial)", YELLOW)
+
+        kv(f"Last {window} blocks", value)
+
+    kv(
+        "Detection",
+        col(
+            "canonical Lithos genesis + Holding-contract fingerprint",
+            DIM
+        )
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Network / pool economics
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1110,7 +1562,15 @@ def fetch_buckets(base, days):
         )
 
 
-def render(base, days, refresh, nisp_state_file):
+def render(
+    base,
+    node_base,
+    days,
+    refresh,
+    nisp_state_file,
+    adoption_state_file,
+    adoption_enabled
+):
     commitment = api_get(base, "/mining/commitment")
     workers = api_get(base, "/stats/mining/workers")
 
@@ -1123,6 +1583,26 @@ def render(base, days, refresh, nisp_state_file):
 
     totals_doc = api_get(base, "/stats/mining/totals")
     bucket_doc = fetch_buckets(base, days)
+
+    try:
+        difficulty_doc = api_get(base, "/stats/mining/difficulty")
+    except Exception:
+        difficulty_doc = {}
+
+    if adoption_enabled:
+        try:
+            adoption = update_network_adoption(
+                node_base,
+                stats_doc,
+                difficulty_doc,
+                adoption_state_file
+            )
+        except Exception as exc:
+            adoption = {"error": safe_text(exc)}
+    else:
+        adoption = {
+            "error": "disabled with --no-adoption"
+        }
 
     totals = totals_doc.get("totals") or {}
     nisp_history = update_nisp_history(
@@ -1179,6 +1659,9 @@ def render(base, days, refresh, nisp_state_file):
 
     section("CURRENT SHARE SESSION")
     render_workers(workers, nisp_history, opportunity_estimate)
+
+    section("NETWORK ADOPTION")
+    render_network_adoption(adoption)
 
     section("POOL / NETWORK ECONOMICS")
     print(
@@ -1238,6 +1721,18 @@ def main():
     )
 
     parser.add_argument(
+        "--node-url",
+        default="http://127.0.0.1:9053",
+        help="Ergo node HTTP(S) API base URL used for adoption scanning"
+    )
+
+    parser.add_argument(
+        "--no-adoption",
+        action="store_true",
+        help="Disable Ergo-chain Lithos adoption scanning"
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {VERSION}"
@@ -1270,6 +1765,18 @@ def main():
     )
 
     parser.add_argument(
+        "--adoption-state-file",
+        default=None,
+        help="Persistent network-adoption cache (default: XDG state directory)"
+    )
+
+    parser.add_argument(
+        "--reset-adoption-history",
+        action="store_true",
+        help="Discard cached Ergo block classifications before starting"
+    )
+
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Render once and exit"
@@ -1292,11 +1799,22 @@ def main():
     interval = max(1, args.interval)
     days = max(1, min(args.days, 30))
     base_url = normalize_base_url(args.url)
+    node_base_url = normalize_base_url(args.node_url)
     nisp_state_file = args.state_file or default_nisp_state_file()
+    adoption_state_file = (
+        args.adoption_state_file
+        or default_adoption_state_file()
+    )
 
     if args.reset_nisp_history:
         try:
             os.remove(nisp_state_file)
+        except FileNotFoundError:
+            pass
+
+    if args.reset_adoption_history:
+        try:
+            os.remove(adoption_state_file)
         except FileNotFoundError:
             pass
 
@@ -1306,7 +1824,15 @@ def main():
     try:
         while True:
             try:
-                render(base_url, days, interval, nisp_state_file)
+                render(
+                    base_url,
+                    node_base_url,
+                    days,
+                    interval,
+                    nisp_state_file,
+                    adoption_state_file,
+                    not args.no_adoption
+                )
 
             except Exception as exc:
                 print(CLEAR_HOME, end="")

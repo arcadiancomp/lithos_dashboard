@@ -18,6 +18,8 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 - Prominent NISP availability percentage
 - Exact rollup-start correlation while NISP is held or unheld
 - Estimated miner opportunity cost for rollups encountered while unqualified
+- On-chain Lithos network-adoption tracking over 100, 500, and 1,000 blocks
+- Implied Lithos hashrate and unique collateral-lender counts
 - Pool and network economic statistics
 - Lithos block counts
 - Initial holding value
@@ -35,6 +37,7 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 
 - Python 3
 - Lithos Client HTTP API
+- Ergo node REST API for network-adoption scanning
 - ANSI-compatible terminal
 
 The dashboard uses only Python's standard library.
@@ -100,6 +103,18 @@ Remote API:
 lithos_dashboard --url http://192.168.1.10:9000
 ```
 
+Use a different Ergo node API:
+
+```bash
+lithos_dashboard --node-url http://192.168.1.10:9053
+```
+
+Disable chain adoption scanning:
+
+```bash
+lithos_dashboard --no-adoption
+```
+
 Disable ANSI colors:
 
 ```bash
@@ -136,6 +151,40 @@ participation, top-ups, and rollup value change.
 The exact rollup correlation starts with v0.1.1 because earlier state files did
 not retain per-height NISP observations. Existing aggregate lapse counters are
 preserved during the upgrade.
+
+## Network adoption
+
+Starting with v0.1.2, the dashboard can identify Lithos-mined Ergo blocks
+directly from the canonical chain instead of relying on pool labels.
+
+The detector learns the current Lithos Holding ErgoTree from a confirmed
+genesis transaction and classifies a block as Lithos only when:
+
+- transaction output zero uses that Holding contract, and
+- the rollup NFT at output zero is minted from input zero's collateral box ID.
+
+The dashboard reports rolling 100-, 500-, and 1,000-block Lithos shares,
+the number of distinct collateral-lender keys, and an implied Lithos
+hashrate using the Ergo network hashrate reported for the current difficulty
+epoch.
+
+The first run scans up to 1,000 blocks and can take several seconds. Results
+are cached in:
+
+```text
+~/.local/state/lithos_dashboard/adoption_history.json
+```
+
+Later refreshes reuse canonical block IDs and fetch full transaction data only
+for new or reorged blocks.
+
+Because a Lithos block's Ergo coinbase is paid to the selected collateral
+lender, the address credited as the Ergo block miner can rotate from one
+Lithos block to another. The genesis transaction is therefore the reliable
+protocol fingerprint.
+
+The Ergo node should have its extra index enabled so historical transaction
+lookups are available.
 
 ## Economics
 
@@ -174,7 +223,8 @@ Lithos Dashboard makes these economics visible in real time.
 
 ## Security
 
-The dashboard performs read-only HTTP GET requests against the Lithos API.
+The dashboard performs read-only HTTP GET requests against the Lithos API
+and, when network-adoption tracking is enabled, the Ergo node API.
 
 It does not require a wallet password, Ergo node API key, Lithos API key,
 seed phrase, or private key.

@@ -31,6 +31,7 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 - Local direct DEX executor income
 - Daily historical revenue table
 - ANSI color-coded terminal display
+- Responsive two-column layout on wide terminals (140+ columns)
 - No third-party Python dependencies
 
 ## Requirements
@@ -120,6 +121,15 @@ Disable ANSI colors:
 ```bash
 lithos_dashboard --no-color
 ```
+
+### Responsive terminal layout
+
+Starting with v0.1.3, the dashboard automatically uses a compact two-column
+layout when the terminal is at least 140 columns wide. This makes better use
+of horizontal space and substantially reduces the number of terminal rows
+needed on common 1920x1080 displays.
+
+Narrower terminals keep the original stacked layout automatically.
 
 NISP reliability history is persisted under the user's XDG state directory
 (default: `~/.local/state/lithos_dashboard/nisp_history.json`).

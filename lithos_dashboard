@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -37,7 +38,7 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -217,6 +218,59 @@ def kv(label, value, label_width=28):
         + col(f"{label:<{label_width}}", DIM)
         + str(value)
     )
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def visible_len(value):
+    return len(ANSI_RE.sub("", str(value)))
+
+
+def pad_ansi(value, width):
+    value = str(value)
+    return value + (" " * max(0, width - visible_len(value)))
+
+
+def compact_kv(label, value, label_width=23):
+    return (
+        "  "
+        + col(f"{label:<{label_width}}", DIM)
+        + str(value)
+    )
+
+
+def print_columns(left_title, left_lines, right_title, right_lines):
+    # ANSI-aware side-by-side panels for wide, low-height terminals.
+    terminal_width = shutil.get_terminal_size((150, 40)).columns
+    total_width = max(120, min(terminal_width, 180))
+    gap = 4
+    panel_width = (total_width - gap) // 2
+
+    left_heading = col(f"  {left_title}", BOLD, CYAN)
+    right_heading = col(f"  {right_title}", BOLD, CYAN)
+
+    print()
+    print(
+        pad_ansi(left_heading, panel_width)
+        + (" " * gap)
+        + right_heading
+    )
+    print(
+        col("─" * panel_width, DIM)
+        + (" " * gap)
+        + col("─" * panel_width, DIM)
+    )
+
+    rows = max(len(left_lines), len(right_lines))
+    for i in range(rows):
+        left = left_lines[i] if i < len(left_lines) else ""
+        right = right_lines[i] if i < len(right_lines) else ""
+        print(
+            pad_ansi(left, panel_width)
+            + (" " * gap)
+            + right
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1448,6 +1502,417 @@ def render_economics(e, span_days):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Wide / low-height layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIDE_LAYOUT_MIN_COLUMNS = 140
+
+
+def wide_commitment_and_session(c, w):
+    lines = []
+
+    state = str(c.get("state", "unknown"))
+    height = integer(c.get("height"))
+    config_diff = c.get("configDiff", "-")
+    can_commit = c.get("canCommit", False)
+    blocked = c.get("blockedReason")
+
+    if state == "active":
+        state_badge = badge("ACTIVE", "good")
+    elif state in ("waiting", "registering"):
+        state_badge = badge(state.upper(), "warn")
+    else:
+        state_badge = badge(state.upper(), "bad")
+
+    lines.append(compact_kv("Commitment state", state_badge))
+    lines.append(compact_kv("Chain height", col(f"{height:,}", BOLD, WHITE)))
+    lines.append(compact_kv("Configured difficulty", col(config_diff, BOLD, CYAN)))
+
+    inforce = c.get("inForce")
+    if inforce:
+        lines.append(
+            compact_kv(
+                "In-force difficulty",
+                col(inforce.get("diff", "-"), BOLD, GREEN)
+            )
+        )
+
+    pending = c.get("pending")
+    if pending:
+        lines.append(
+            compact_kv(
+                "Pending difficulty",
+                col(pending.get("diff", "-"), BOLD, YELLOW)
+            )
+        )
+
+    replaceable = integer(c.get("replaceableFromHeight"))
+    if replaceable:
+        remaining = max(0, replaceable - height)
+        lines.append(
+            compact_kv(
+                "Next change allowed",
+                f"{remaining:,} blocks @ {replaceable:,}"
+            )
+        )
+
+    if not can_commit and blocked:
+        lines.append(compact_kv("Commit control", col(blocked, YELLOW)))
+
+    accepted = integer(w.get("acceptedShares"))
+    rejected = integer(w.get("rejectedShares"))
+    supers = integer(w.get("superShares"))
+    sph = dec(w.get("superSharesPerHour"))
+    candidates = integer(w.get("blockCandidates"))
+
+    if rejected == 0:
+        share_text = (
+            col(f"{accepted:,} accepted", GREEN, BOLD)
+            + " / "
+            + col("0 rejected", GREEN)
+        )
+    else:
+        share_text = (
+            col(f"{accepted:,} accepted", GREEN)
+            + " / "
+            + col(f"{rejected:,} rejected", RED, BOLD)
+        )
+
+    lines.append(compact_kv("Shares this session", share_text))
+    lines.append(compact_kv("Super shares", col(f"{supers:,}", BOLD, CYAN)))
+    lines.append(compact_kv("Super shares / hour", col(fmt_rate(sph), BOLD, CYAN)))
+
+    if candidates:
+        lines.append(
+            compact_kv("Block candidates", col(f"{candidates:,}", MAGENTA))
+        )
+
+    nisp = w.get("nisp") or {}
+    held = bool(nisp.get("held"))
+    nisp_count = integer(nisp.get("superSharesInWindow"))
+    required = integer(nisp.get("required"), 10)
+
+    nisp_text = badge(
+        "NISP HELD" if held else "NISP NOT HELD",
+        "good" if held else "bad"
+    )
+    nisp_text += f"  {nisp_count}/{required}"
+    lines.append(compact_kv("NISP status", nisp_text))
+
+    blocks_remaining = nisp.get("blocksRemaining")
+    valid_through = nisp.get("validThroughHeight")
+    if blocks_remaining is not None:
+        remaining = integer(blocks_remaining)
+        coverage = f"{remaining} blocks"
+        if valid_through:
+            coverage += f" through {integer(valid_through):,}"
+        lines.append(
+            compact_kv(
+                "NISP coverage",
+                col(coverage, GREEN if remaining >= 15 else YELLOW)
+            )
+        )
+
+    return lines
+
+
+def wide_nisp_and_adoption(state, opportunity_estimate, adoption):
+    lines = []
+
+    observed = integer(state.get("observedHeights"))
+    lapse_heights = integer(state.get("lapseHeights"))
+    events = integer(state.get("lapseEvents"))
+    current = integer(state.get("currentLapseHeights"))
+    longest = integer(state.get("longestLapseHeights"))
+
+    availability = (
+        100.0 * max(0, observed - lapse_heights) / observed
+        if observed else 100.0
+    )
+
+    if availability >= 95.0:
+        availability_color = GREEN
+    elif availability >= 85.0:
+        availability_color = YELLOW
+    else:
+        availability_color = RED
+
+    lines.append(
+        compact_kv(
+            "NISP availability",
+            col(f"{availability:.2f}%", BOLD, availability_color)
+            + f"  ({max(0, observed - lapse_heights):,}/{observed:,})"
+        )
+    )
+    lines.append(
+        compact_kv(
+            "Lapse events",
+            col(f"{events:,}", GREEN if events == 0 else YELLOW)
+        )
+    )
+    lines.append(
+        compact_kv(
+            "Heights with lapse",
+            col(
+                f"{lapse_heights:,}/{observed:,}",
+                GREEN if lapse_heights == 0 else YELLOW
+            )
+        )
+    )
+
+    if current:
+        lines.append(
+            compact_kv(
+                "Current lapse",
+                col(f"{current:,} height(s)", RED, BOLD)
+            )
+        )
+
+    lines.append(
+        compact_kv(
+            "Longest lapse",
+            col(
+                f"{longest:,} height(s)",
+                GREEN if longest == 0 else YELLOW
+            )
+        )
+    )
+
+    started = state.get("trackingStartedHeight")
+    if started:
+        lines.append(
+            compact_kv("NISP tracking since", f"{integer(started):,}")
+        )
+
+    last_lapse = state.get("lastLapseHeight")
+    if last_lapse:
+        lines.append(
+            compact_kv("Last lapse", f"{integer(last_lapse):,}")
+        )
+
+    rollups = integer(state.get("rollupsObservedWithNispStatus"))
+    eligible = integer(state.get("rollupsEligible"))
+    missed = integer(state.get("rollupsMissed"))
+
+    lines.append(
+        compact_kv(
+            "Rollup NISP sample",
+            f"{rollups:,} ({eligible:,} eligible / {missed:,} unheld)"
+        )
+    )
+
+    missed_initial = (
+        Decimal(integer(state.get("missedRollupInitialNanoErg"))) / NANO
+    )
+    lines.append(
+        compact_kv(
+            "Missed pool value",
+            col(
+                f"{fmt_erg(missed_initial)} ERG",
+                GREEN if missed == 0 else YELLOW
+            )
+        )
+    )
+
+    if opportunity_estimate is not None:
+        lines.append(
+            compact_kv(
+                "Est. reward missed",
+                col(
+                    f"{fmt_erg(opportunity_estimate['erg'])} ERG",
+                    RED if missed else GREEN,
+                    BOLD
+                )
+            )
+        )
+        lines.append(
+            compact_kv(
+                "Opportunity model",
+                col(
+                    f"{float(opportunity_estimate['sharePct']):.1f}% share; "
+                    f"{opportunity_estimate['sampleRollups']} rollups",
+                    DIM
+                )
+            )
+        )
+
+    error = adoption.get("error")
+    if error:
+        lines.append(
+            compact_kv(
+                "Network adoption",
+                col(safe_text(error), YELLOW)
+            )
+        )
+        return lines
+
+    network_hps = dec(adoption.get("networkHashrate"))
+    if network_hps > 0:
+        lines.append(
+            compact_kv(
+                "Ergo network hash",
+                col(fmt_hashrate(network_hps), BOLD, WHITE)
+            )
+        )
+
+    windows = adoption.get("windows") or {}
+    for window in ADOPTION_WINDOWS:
+        row = windows.get(window) or {}
+        scanned = integer(row.get("scanned"))
+        lithos = integer(row.get("lithos"))
+        share = dec(row.get("share")) * Decimal(100)
+        implied = dec(row.get("impliedHashrate"))
+        lenders = integer(row.get("uniqueLenders"))
+
+        if share >= Decimal("10"):
+            share_color = GREEN
+        elif share >= Decimal("3"):
+            share_color = CYAN
+        else:
+            share_color = WHITE
+
+        value = (
+            f"{lithos}/{scanned}  "
+            + col(f"{share:.2f}%", BOLD, share_color)
+        )
+        if network_hps > 0:
+            value += "  " + col("~" + fmt_hashrate(implied), CYAN)
+        value += f"  {lenders} lenders"
+
+        lines.append(compact_kv(f"Last {window} blocks", value))
+
+    return lines
+
+
+def wide_economics_columns(e, span_days):
+    left = [
+        compact_kv("Lithos blocks", col(f"{e['lithos_blocks']:,}", BOLD, WHITE)),
+        compact_kv("Initial holding", col(f"{fmt_erg(e['genesis'])} ERG", BOLD, CYAN)),
+        compact_kv("Candidate top-ups", col(f"{fmt_erg(e['topup'])} ERG", BOLD, GREEN)),
+    ]
+
+    if e["genesis"] > 0:
+        left.append(
+            compact_kv(
+                "Top-up boost",
+                col(
+                    fmt_pct(e["boost"]),
+                    BOLD,
+                    GREEN if e["boost"] > 0 else WHITE
+                )
+                + " vs initial"
+            )
+        )
+
+    left.extend([
+        compact_kv(
+            "Initial / block",
+            f"{fmt_erg(e['initial_per_block'])} ERG"
+        ),
+        compact_kv(
+            "Top-up / block",
+            col(f"{fmt_erg(e['topup_per_block'])} ERG", GREEN)
+        ),
+        compact_kv(
+            "Holding inflow / block",
+            col(f"{fmt_erg(e['inflow_per_block'])} ERG", BOLD, GREEN)
+        ),
+        compact_kv(
+            "Priority bids",
+            f"{fmt_erg(e['priority'])} ERG"
+        ),
+    ])
+
+    right = [
+        compact_kv("DEX gross fees", f"{fmt_erg(e['dex_gross'])} ERG"),
+        compact_kv("DEX after tx fees", f"{fmt_erg(e['dex_net'])} ERG"),
+        compact_kv("DEX into pool", f"{fmt_erg(e['pool_dex'])} ERG"),
+        compact_kv(
+            "Other candidate top-up",
+            col(f"{fmt_erg(e['other_topup'])} ERG", MAGENTA)
+        ),
+        compact_kv("Network payout rewards", f"{fmt_erg(e['payout_reward'])} ERG"),
+        compact_kv(
+            "Local realized payout",
+            col(
+                f"{fmt_erg(e['local_payout'])} ERG",
+                BOLD,
+                GREEN if e["local_payout"] > 0 else YELLOW
+            )
+        ),
+        compact_kv(
+            "Local direct DEX net",
+            col(
+                f"{fmt_erg(e['local_dex_net'])} ERG",
+                GREEN if e["local_dex_net"] > 0 else WHITE
+            )
+        ),
+    ]
+
+    if span_days > 0:
+        right.append(
+            compact_kv("Retained history", f"{span_days:.2f} days")
+        )
+
+        if e["lithos_blocks"]:
+            right.append(
+                compact_kv(
+                    "Lithos blocks / day",
+                    f"{e['lithos_blocks'] / span_days:.2f}"
+                )
+            )
+
+        right.append(
+            compact_kv(
+                "Pool top-ups / day",
+                col(
+                    f"{float(e['topup']) / span_days:.3f} ERG/day",
+                    GREEN
+                )
+            )
+        )
+
+    return left, right
+
+
+def render_wide_overview(
+    commitment,
+    workers,
+    nisp_history,
+    opportunity_estimate,
+    adoption,
+    econ,
+    span_days
+):
+    print_columns(
+        "MINER + SHARE SESSION",
+        wide_commitment_and_session(commitment, workers),
+        "NISP + NETWORK ADOPTION",
+        wide_nisp_and_adoption(
+            nisp_history,
+            opportunity_estimate,
+            adoption
+        )
+    )
+
+    left, right = wide_economics_columns(econ, span_days)
+    print_columns(
+        "POOL ECONOMICS",
+        left,
+        "REVENUE + ACTIVITY",
+        right
+    )
+
+    print(
+        col(
+            "  Network/pool figures are retained-history totals; "
+            "not all are personal income.",
+            YELLOW
+        )
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Daily table
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1654,25 +2119,38 @@ def render(
             )
         )
 
-    section("MINER STATE")
-    render_commitment(commitment)
+    terminal_columns = shutil.get_terminal_size((150, 40)).columns
 
-    section("CURRENT SHARE SESSION")
-    render_workers(workers, nisp_history, opportunity_estimate)
-
-    section("NETWORK ADOPTION")
-    render_network_adoption(adoption)
-
-    section("POOL / NETWORK ECONOMICS")
-    print(
-        col(
-            "  These figures describe the Lithos network/pool retained history, "
-            "not all of them are your personal income.",
-            YELLOW
+    if terminal_columns >= WIDE_LAYOUT_MIN_COLUMNS:
+        render_wide_overview(
+            commitment,
+            workers,
+            nisp_history,
+            opportunity_estimate,
+            adoption,
+            econ,
+            span_days
         )
-    )
-    print()
-    render_economics(econ, span_days)
+    else:
+        section("MINER STATE")
+        render_commitment(commitment)
+
+        section("CURRENT SHARE SESSION")
+        render_workers(workers, nisp_history, opportunity_estimate)
+
+        section("NETWORK ADOPTION")
+        render_network_adoption(adoption)
+
+        section("POOL / NETWORK ECONOMICS")
+        print(
+            col(
+                "  These figures describe the Lithos network/pool retained history, "
+                "not all of them are your personal income.",
+                YELLOW
+            )
+        )
+        print()
+        render_economics(econ, span_days)
 
     section(f"DAILY HISTORY — LAST {days} UTC DAYS")
     render_daily(bucket_doc.get("buckets") or [])

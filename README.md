@@ -15,6 +15,9 @@ Designed and tested on Linux with Lithos Client v1.0.2.
 - Accepted/rejected super-share monitoring
 - NISP health and remaining coverage
 - Persistent NISP lapse and reliability tracking across restarts
+- Prominent NISP availability percentage
+- Exact rollup-start correlation while NISP is held or unheld
+- Estimated miner opportunity cost for rollups encountered while unqualified
 - Pool and network economic statistics
 - Lithos block counts
 - Initial holding value
@@ -85,6 +88,12 @@ Render once:
 lithos_dashboard --once
 ```
 
+Show version:
+
+```bash
+lithos_dashboard --version
+```
+
 Remote API:
 
 ```bash
@@ -105,6 +114,28 @@ Reset the NISP reliability counters:
 ```bash
 lithos_dashboard --reset-nisp-history
 ```
+
+### NISP opportunity tracking
+
+The dashboard stores the NISP state observed at each rollup-start height and
+correlates those heights with confirmed Lithos genesis records from `/stats`.
+This allows it to count actual Lithos rollups encountered while the local miner
+was NISP-qualified or unqualified.
+
+Heights missed while the dashboard is offline are never guessed.
+
+`Missed initial pool value` is the exact initial holding value of rollups seen
+at an observed unqualified height. It is pool value, not the local miner's
+personal loss.
+
+`Est. miner reward missed` is deliberately labeled as an estimate. It uses the
+current in-force commitment score together with the average reward and total
+score of retained mature rollups. Actual missed rewards can differ as miner
+participation, top-ups, and rollup value change.
+
+The exact rollup correlation starts with v0.1.1 because earlier state files did
+not retain per-height NISP observations. Existing aggregate lapse counters are
+preserved during the upgrade.
 
 ## Economics
 
@@ -150,6 +181,13 @@ seed phrase, or private key.
 
 Keeping the Lithos HTTP API bound to `127.0.0.1` is recommended for local
 installations.
+
+v0.1.1 also hardens API handling by:
+
+- accepting only `http://` and `https://` API base URLs
+- rejecting embedded URL credentials, query strings, and fragments
+- stripping terminal control characters from API-provided strings
+- limiting each API response to 2 MiB before JSON parsing
 
 ## License
 

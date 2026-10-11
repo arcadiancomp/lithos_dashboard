@@ -1,4 +1,6 @@
 # Lithos Dashboard
+[![Lithos Dashboard CI](https://github.com/arcadiancomp/lithos_dashboard/actions/workflows/test.yml/badge.svg)](https://github.com/arcadiancomp/lithos_dashboard/actions/workflows/test.yml)
+
 
 Single-file Python dashboard for Lithos Protocol mining on Ergo.
 

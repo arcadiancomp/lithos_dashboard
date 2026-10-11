@@ -3,7 +3,6 @@ __pycache__/
 *.log
 .env
 .DS_Store
-*.before_visual
-*.before_lit_valuation
-*.before_lan
-*.before_web_listen
+*.before_*
+lithos_dashboard_next*
+make_single_file.py

@@ -1,0 +1,65 @@
+name: Lithos Dashboard CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - lithos_dashboard
+      - .github/workflows/test.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - lithos_dashboard
+      - .github/workflows/test.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lithos-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compile and check CLI
+        run: |
+          python3 -m py_compile lithos_dashboard
+          python3 lithos_dashboard --version
+          python3 lithos_dashboard --help | grep -q -- '--numeric'
+          python3 lithos_dashboard --help | grep -q -- '--web-listen'
+
+      - name: Check embedded UI and reject invalid LIT pools
+        run: |
+          python3 -c 'import runpy; d=runpy.run_path("lithos_dashboard"); html=d["LITHOS_WEB_HTML_BYTES"]; assert "Lithos Dashboard" in (html.decode() if isinstance(html, bytes) else html); q=d["_LITHOS_PRICING"].price_income(None, "http://127.0.0.1:9000", {"litMonth": 100}, pool={"tokenY": "invalid"}, include_usd=False, include_quote=False); assert not q.get("available"); print("Embedded UI and invalid-token rejection passed")'
+
+      - name: Smoke-test local browser HTTP server
+        run: |
+          python3 -c 'import runpy; runpy.run_path("lithos_dashboard")["_LITHOS_WEB"].main(["--demo", "--listen", "127.0.0.1", "--port", "18787"])' > /tmp/lithos-web.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:18787/ -o /tmp/lithos-page.html; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" -ne 1 ]; then cat /tmp/lithos-web.log; exit 1; fi
+          grep -q '<title>Lithos Dashboard</title>' /tmp/lithos-page.html
+          snapshot_ready=0
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:18787/api/snapshot > /tmp/lithos-snapshot.json && python3 -c 'import json; d=json.load(open("/tmp/lithos-snapshot.json")); assert isinstance(d,dict) and d.get("demo") is True'; then
+              snapshot_ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$snapshot_ready" -ne 1 ]; then cat /tmp/lithos-web.log; exit 1; fi

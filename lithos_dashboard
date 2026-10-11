@@ -38,7 +38,7 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.1.4"
+VERSION = "0.2.1"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -1659,7 +1659,7 @@ def render_income_projection(model, wide):
         for item in left + right:
             print(item)
     print(col("  Gross conditional estimates; evaluation rewards can change; "
-              "bond refunds excluded; LIT has no USD valuation.", DIM))
+              "bond refunds excluded; LIT market value is indicative.", DIM))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2327,6 +2327,16 @@ def render(
         income_model, terminal_columns >= WIDE_LAYOUT_MIN_COLUMNS
     )
 
+    try:
+        from lithos_pricing import price_income, numeric_lines
+        lit_market = price_income(sys.modules[__name__], base, income_model, height=source_height)
+        print()
+        print(col("  LIT / ERG / USD MARKET VALUATION (INDICATIVE)", BOLD, CYAN))
+        for lit_line in numeric_lines(lit_market):
+            print(col(lit_line, CYAN if lit_market.get("available") else YELLOW))
+    except Exception as market_exc:
+        print(col("  LIT market price temporarily unavailable: " + type(market_exc).__name__, YELLOW))
+
     section(f"DAILY HISTORY — LAST {days} UTC DAYS")
     render_daily(bucket_doc.get("buckets") or [])
 
@@ -2354,7 +2364,7 @@ def render(
 
     print(
         col(
-            "  Ctrl-C exits. Values update in place.",
+            "  © 2026 Arcadian Computers, LLC · MIT License | Ctrl-C exits. Values update in place.",
             DIM
         )
     )
@@ -2441,7 +2451,40 @@ def main():
         help="Disable ANSI colors"
     )
 
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Serve the animated Lithos / Signal browser dashboard on localhost"
+    )
+    parser.add_argument(
+        "--numeric", action="store_true",
+        help="Keep the original numeric terminal dashboard (default)"
+    )
+    parser.add_argument(
+        "--web-port", type=int, default=8787,
+        help="Localhost port for --web (default: 8787)"
+    )
+    parser.add_argument(
+        "--web-listen", default="127.0.0.1",
+        help="Web bind address (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--web-interval", type=int, default=5,
+        help="Sampling seconds for --web (default: 5)"
+    )
+
     args = parser.parse_args()
+    if args.web and args.numeric:
+        parser.error("--web and --numeric cannot be combined")
+    if args.web:
+        from lithos_web import main as lithos_web_main
+        return lithos_web_main([
+            "--url", args.url,
+            "--days", str(args.days),
+            "--port", str(args.web_port),
+            "--listen", args.web_listen,
+            "--interval", str(args.web_interval),
+        ])
+
 
     USE_COLOR = (
         not args.no_color

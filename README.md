@@ -4,7 +4,7 @@ A lightweight terminal dashboard for monitoring a
 [Lithos Protocol](https://github.com/Lithos-Protocol/Lithos-Client)
 miner, sequencer, and decentralized Ergo mining pool participant.
 
-Designed and tested on Linux with Lithos Client v1.0.2.
+Tested on Linux with Lithos Client v1.0.3.
 
 ![Lithos Dashboard](assets/lithos_dashboard.png)
 
@@ -211,7 +211,7 @@ refunded submission bonds as your personal earnings.
 - **All claims ERG / 30d:** uses the **mean** of the same rewards, including
   unusual projected claims. This is an alternate scenario, not an upper bound.
 - **LIT / 30d:** uses the median **confirmed** LIT reward per payout only;
-  each raw LIT amount has nine decimal places. No LIT-to-USD conversion.
+  each raw LIT amount has nine decimal places. LIT-to-ERG and USD market valuation is available separately in v0.2.1.
 - **Confirmed:** cumulative local ERG reward and surplus, plus local LIT reward;
   excludes returned ERG bonds.
 - **Pending:** sums evaluation/payout-phase ERG claims, with provisional values
@@ -283,3 +283,22 @@ MIT
 ## Author
 
 Arcadian Computers, LLC
+
+## Graphical dashboard (v0.2.1)
+
+This MIT-licensed dashboard is authored by **Arcadian Computers, LLC**.
+
+- `lithos_dashboard --web --web-listen 192.168.1.9` starts the animated
+  browser dashboard on that LAN interface (TCP 8787 by default).
+- `lithos_dashboard --numeric` retains the original full numeric terminal view.
+- `lithos_dashboard` defaults to the numeric terminal view.
+- The browser also offers a Visual / Numbers toggle, live charts, NISP
+  reliability, collateral utilization, confirmed rewards and conditional
+  monthly income projections.
+- LIT valuation uses the **Ergo mainnet LIT** liquidity pool and a read-only
+  swap simulation, plus a fresh ERG/USD rate when available. Estimates are
+  not guaranteed cash proceeds, and unverified prices show as unavailable.
+
+For installation, LAN security, economic methodology, and rollback steps,
+see [Visual Dashboard documentation](README_VISUAL.md). The browser service
+has **no web authentication**; restrict TCP 8787 to trusted LAN hosts.

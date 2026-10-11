@@ -275,20 +275,10 @@ v0.1.1 also hardens API handling by:
 - rejecting embedded URL credentials, query strings, and fragments
 - stripping terminal control characters from API-provided strings
 - limiting each API response to 2 MiB before JSON parsing
-
-## License
-
-MIT
-
-## Author
-
-Arcadian Computers, LLC
-
+- 
 ## Graphical dashboard (v0.2.1)
 
-This MIT-licensed dashboard is authored by **Arcadian Computers, LLC**.
-
-- `lithos_dashboard --web --web-listen 192.168.1.9` starts the animated
+- `lithos_dashboard --web --web-listen 192.168.1.200 (for example)` starts the animated
   browser dashboard on that LAN interface (TCP 8787 by default).
 - `lithos_dashboard --numeric` retains the original full numeric terminal view.
 - `lithos_dashboard` defaults to the numeric terminal view.
@@ -299,6 +289,10 @@ This MIT-licensed dashboard is authored by **Arcadian Computers, LLC**.
   swap simulation, plus a fresh ERG/USD rate when available. Estimates are
   not guaranteed cash proceeds, and unverified prices show as unavailable.
 
-For installation, LAN security, economic methodology, and rollback steps,
-see [Visual Dashboard documentation](README_VISUAL.md). The browser service
-has **no web authentication**; restrict TCP 8787 to trusted LAN hosts.
+## License
+
+MIT
+
+## Author
+
+Arcadian Computers, LLC

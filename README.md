@@ -6,6 +6,20 @@ Single-file Python dashboard for Lithos Protocol mining on Ergo.
 
 Maintained by Arcadian Computers, LLC. Licensed under MIT.
 
+## Screenshots
+
+### Numeric dashboard
+
+![Lithos Dashboard numeric interface](docs/lithos_dashboard_numeric.png)
+
+Traditional full numeric interface for terminal-focused monitoring and detailed pool accounting.
+
+### Web UI
+
+![Lithos Dashboard Web UI](docs/lithos_dashboard_webui.png)
+
+Browser-based interface with live mining overview, NISP reliability, economics, and historical activity panels.
+
 ## Features
 
 - Real-time browser dashboard with animated charts

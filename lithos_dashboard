@@ -38,8 +38,9 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_BLOCK_TX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 def safe_text(value):
@@ -145,7 +146,7 @@ def fmt_pct(v):
     return f"{float(v):+.1f}%"
 
 
-def api_get(base, path, params=None, timeout=4):
+def api_get(base, path, params=None, timeout=4, max_response_bytes=MAX_RESPONSE_BYTES):
     base = normalize_base_url(base)
     url = base + path
 
@@ -167,16 +168,16 @@ def api_get(base, path, params=None, timeout=4):
                 declared = int(content_length)
             except ValueError:
                 declared = 0
-            if declared > MAX_RESPONSE_BYTES:
+            if declared > max_response_bytes:
                 raise ValueError(
-                    f"API response exceeds {MAX_RESPONSE_BYTES} bytes"
+                    f"API response exceeds {max_response_bytes} bytes "f"({urllib.parse.urlsplit(url).path})"
                 )
 
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        raw = response.read(max_response_bytes + 1)
 
-    if len(raw) > MAX_RESPONSE_BYTES:
+    if len(raw) > max_response_bytes:
         raise ValueError(
-            f"API response exceeds {MAX_RESPONSE_BYTES} bytes"
+            f"API response exceeds {max_response_bytes} bytes "f"({urllib.parse.urlsplit(url).path})"
         )
 
     return sanitize_json(json.loads(raw.decode("utf-8")))
@@ -969,31 +970,48 @@ def discover_holding_tree(node_base, stats_doc, state):
 
 
 def fetch_chain_headers(node_base, start_height, end_height):
-    count = end_height - start_height + 1
-    if count <= 0:
+    """Read a height window using bounded Ergo 6.0.6 chain slices.
+
+    Despite the OpenAPI range description, Ergo 6.0.6's implementation
+    returns heights (fromHeight, toHeight]. The requested inclusive
+    window [first, last] therefore uses (first - 1, last) on the wire.
+    Keep the global 2 MiB response guard intact.
+    """
+    if end_height < start_height:
         return []
 
-    page = api_get(
-        node_base,
-        "/blocks/lastHeaders/" + str(count),
-        timeout=8
-    )
-
-    if not isinstance(page, list):
-        raise ValueError("Ergo lastHeaders returned a non-list response")
-
-    headers = [
-        h for h in page
-        if isinstance(h, dict)
-        and start_height <= integer(h.get("height")) <= end_height
-    ]
-    headers.sort(key=lambda h: integer(h.get("height")))
-
-    if len(headers) != count:
-        raise ValueError(
-            f"Ergo lastHeaders returned {len(headers)} canonical headers; "
-            f"expected {count} for heights {start_height}..{end_height}"
+    headers = []
+    for first in range(start_height, end_height + 1, CHAIN_SLICE_BATCH):
+        after_last = min(first + CHAIN_SLICE_BATCH, end_height + 1)
+        page = api_get(
+            node_base,
+            "/blocks/chainSlice",
+            params={"fromHeight": first - 1, "toHeight": after_last - 1},
+            timeout=8
         )
+
+        if not isinstance(page, list):
+            raise ValueError(
+                f"Ergo chainSlice returned a non-list response "
+                f"for heights {first}..{after_last - 1}"
+            )
+
+        batch = [
+            h for h in page
+            if isinstance(h, dict)
+            and first <= integer(h.get("height")) < after_last
+        ]
+        batch.sort(key=lambda h: integer(h.get("height")))
+
+        # Length alone is insufficient: duplicate heights can conceal gaps.
+        heights = [integer(h.get("height")) for h in batch]
+        if heights != list(range(first, after_last)):
+            raise ValueError(
+                f"Ergo chainSlice has missing or duplicate canonical headers "
+                f"for heights {first}..{after_last - 1}"
+            )
+
+        headers.extend(batch)
 
     return headers
 
@@ -1038,7 +1056,10 @@ def classify_ergo_block(node_base, header, holding_tree):
         "/blocks/"
         + urllib.parse.quote(block_id, safe="")
         + "/transactions",
-        timeout=8
+        timeout=15,
+        # Ergo returns the entire block's transactions in one unpaged reply.
+        # Only this endpoint gets an elevated limit; all other APIs stay 2 MiB.
+        max_response_bytes=MAX_BLOCK_TX_RESPONSE_BYTES
     )
 
     transactions = block_txs.get("transactions") or []
@@ -2863,7 +2884,7 @@ def _lithos_make_web():
     from urllib.parse import urlsplit
     lithos_pricing = _LITHOS_PRICING
 
-    VERSION = '0.2.1'
+    VERSION = '0.2.2'
 
 
 

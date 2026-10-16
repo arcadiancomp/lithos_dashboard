@@ -6,11 +6,13 @@ on:
     paths:
       - lithos_dashboard
       - .github/workflows/test.yml
+      - "tests/**"
   pull_request:
     branches: [main]
     paths:
       - lithos_dashboard
       - .github/workflows/test.yml
+      - "tests/**"
 
 permissions:
   contents: read
@@ -34,6 +36,9 @@ jobs:
           python3 lithos_dashboard --version
           python3 lithos_dashboard --help | grep -q -- '--numeric'
           python3 lithos_dashboard --help | grep -q -- '--web-listen'
+
+      - name: Run network adoption regression tests
+        run: python3 -m unittest discover -s tests -v
 
       - name: Check embedded UI and reject invalid LIT pools
         run: |

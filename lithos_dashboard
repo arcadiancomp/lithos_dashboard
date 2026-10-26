@@ -38,7 +38,7 @@ SHOW_CURSOR = "\033[?25h"
 
 USE_COLOR = True
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_BLOCK_TX_RESPONSE_BYTES = 16 * 1024 * 1024
 
@@ -181,6 +181,82 @@ def api_get(base, path, params=None, timeout=4, max_response_bytes=MAX_RESPONSE_
         )
 
     return sanitize_json(json.loads(raw.decode("utf-8")))
+
+
+def fetch_payment_ledger(base, timeout=10, page_limit=500):
+    """Fetch a complete Lithos payment ledger using its documented offset API.
+
+    The node caps a single page at 500 rows. Pages are requested oldest-first,
+    so newly confirmed payouts normally append rather than displace older rows.
+    Freeze the initial total: any later additions will appear on the next read.
+    Claims and bounties are full snapshots included on *every* response; take
+    those only from the initial page instead of concatenating duplicates.
+
+    On a too-large JSON reply, halve the current page size without disabling
+    the generic 2MiB response guard. Reject missing or overlapping pages.
+    """
+    if not isinstance(page_limit, int) or isinstance(page_limit, bool) or not 1 <= page_limit <= 500:
+        raise ValueError("payment page_limit must be an integer between 1 and 500")
+
+    offset = 0
+    target_total = None
+    first = None
+    payments = []
+    seen_outputs = set()
+    while target_total is None or offset < target_total:
+        count = page_limit if target_total is None else min(page_limit, target_total - offset)
+        while True:
+            try:
+                doc = api_get(
+                    base, "/stats/mining/payments",
+                    params={"offset": offset, "limit": count, "sort": "paid", "order": "asc"},
+                    timeout=timeout,
+                )
+                break
+            except ValueError as exc:
+                if "API response exceeds" not in str(exc) or count == 1:
+                    raise
+                count = max(1, count // 2)
+
+        if not isinstance(doc, dict):
+            raise ValueError("Lithos payment page is not an object")
+        if doc.get("status") != "ready":
+            if offset:
+                raise ValueError("Lithos payment ledger became unavailable during pagination")
+            return doc
+        rows = doc.get("payments")
+        total = doc.get("total")
+        page_offset = doc.get("offset")
+        if not isinstance(rows, list):
+            raise ValueError("Lithos payment page has no payments list")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            raise ValueError("Lithos payment page has an invalid total")
+        if page_offset != offset or not isinstance(page_offset, int) or isinstance(page_offset, bool):
+            raise ValueError("Lithos payment page returned an unexpected offset")
+        if first is None:
+            first = doc
+            target_total = total
+        elif total < target_total:
+            raise ValueError("Lithos payment total shrank during pagination; retry this snapshot")
+        needed = min(count, target_total - offset)
+        if len(rows) != needed:
+            raise ValueError(
+                f"Incomplete Lithos payment page at offset {offset}: expected {needed}, received {len(rows)}"
+            )
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("outputId"), str) or not row["outputId"]:
+                raise ValueError("Lithos payment row has no valid outputId")
+            output_id = row["outputId"]
+            if output_id in seen_outputs:
+                raise ValueError(f"Duplicate Lithos payment outputId at offset {offset}: {output_id}")
+            seen_outputs.add(output_id)
+        payments.extend(rows)
+        offset += len(rows)
+        page_limit = min(page_limit, count)  # Remember the last successful safe page size.
+
+    # Return the API's original shape. Only 'payments' is aggregated; each page
+    # includes the entire claim/bounty snapshot and must not be combined there.
+    return dict(first, payments=payments, offset=0, total=target_total)
 
 
 def ms_date(ms):
@@ -1561,8 +1637,8 @@ def calculate_monthly_income(totals, ledger, span_days):
     claims = ledger.get("claims") or []
     if not isinstance(payments, list) or not isinstance(claims, list):
         return {"error": "invalid payment ledger response"}
-    if integer(ledger.get("total")) > len(payments):
-        return {"error": "payout history exceeds one API page (500)"}
+    if integer(ledger.get("total")) != len(payments):
+        return {"error": "payout ledger incomplete (total does not match fetched payments)"}
 
     paid_erg = []
     paid_lit = []
@@ -2232,8 +2308,7 @@ def render(
     bucket_doc = fetch_buckets(base, days)
 
     try:
-        payment_ledger = api_get(base, "/stats/mining/payments",
-                                 params={"limit": 500})
+        payment_ledger = fetch_payment_ledger(base)
     except Exception as exc:
         payment_ledger = {"error": safe_text(exc)}
 
@@ -2884,7 +2959,7 @@ def _lithos_make_web():
     from urllib.parse import urlsplit
     lithos_pricing = _LITHOS_PRICING
 
-    VERSION = '0.2.2'
+    VERSION = '0.2.3'
 
 
 
@@ -2923,7 +2998,9 @@ def _lithos_make_web():
             if cache and time.monotonic() - cache[0] < ttl:
                 return cache[1]
             try:
-                doc = self.core.api_get(self.url, path, params=params, timeout=5)
+                doc = (self.core.fetch_payment_ledger(self.url, timeout=10)
+                       if name == 'ledger' else
+                       self.core.api_get(self.url, path, params=params, timeout=5))
                 self.cached[name] = (time.monotonic(), doc)
                 return doc
             except Exception:
@@ -2966,7 +3043,7 @@ def _lithos_make_web():
             totals_doc = self.get('totals', '/stats/mining/totals', self.interval)
             market = self.get('market', '/collateral/market', 20, optional=True)
             bucket_doc = self.get('buckets', '/stats/mining/buckets', 60, params=self.bucket_params(), optional=True)
-            ledger = self.get('ledger', '/stats/mining/payments', 60, params={'limit': 500}, optional=True)
+            ledger = self.get('ledger', '/stats/mining/payments', 60, optional=True)
             totals = totals_doc.get('totals') or {}
 
             # Shared core owns the precise NISP height accounting and payout model.
